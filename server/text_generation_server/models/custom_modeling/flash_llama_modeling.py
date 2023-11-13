@@ -65,6 +65,8 @@ class LlamaConfig(PretrainedConfig):
         tie_word_embeddings=False,
         rope_scaling=None,
         rope_theta=10000.0,
+        attention_bias=False,
+        rope_dim=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -77,6 +79,8 @@ class LlamaConfig(PretrainedConfig):
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
+        if rope_dim is None:
+            rope_dim = hidden_size // num_attention_heads
 
         self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act
@@ -86,6 +90,8 @@ class LlamaConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.rope_scaling = rope_scaling
         self.rope_theta = rope_theta
+        self.attention_bias = attention_bias
+        self.rope_dim = rope_dim
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -158,7 +164,7 @@ def load_attention(config, prefix, weights):
                 config,
                 prefix=f"{prefix}.W_pack",
                 weights=weights,
-                bias=False,
+                bias=config.attention_bias,
             )
         else:
             return TensorParallelColumnLinear.load_multi(
@@ -166,7 +172,7 @@ def load_attention(config, prefix, weights):
                 prefixes=[f"{prefix}.q_proj", f"{prefix}.k_proj", f"{prefix}.v_proj"],
                 dim=0,
                 weights=weights,
-                bias=False,
+                bias=config.attention_bias,
             )
 
 
@@ -180,6 +186,16 @@ def _load_gqa(config, prefix: str, weights):
         dim=0,
     )
 
+    if config.attention_bias:
+        b = [
+                weights.get_sharded(f"{prefix}.q_proj.bias", dim=0),
+                weights.get_sharded(f"{prefix}.k_proj.bias", dim=0),
+                weights.get_sharded(f"{prefix}.v_proj.bias", dim=0),
+            ]
+        bias = torch.cat(b, dim=0)
+    else:
+        bias = None
+
     if config.quantize not in ["gptq", "awq"]:
         weight = weight.to(dtype=weights.dtype).to(device=weights.device)
 
@@ -192,7 +208,7 @@ def _load_gqa(config, prefix: str, weights):
         ], f"{list(weight.shape)} != {[(num_heads + 2 * config.num_key_value_heads) * head_size, config.hidden_size]}"
 
     return TensorParallelColumnLinear(
-        get_linear(weight, bias=None, quantize=config.quantize)
+        get_linear(weight, bias=bias, quantize=config.quantize)
     )
 
 
@@ -213,7 +229,7 @@ class FlashLlamaAttention(torch.nn.Module):
         # )
         self.rotary_emb = PositionRotaryEmbedding.static(
             config=config,
-            dim=self.head_size,
+            dim=config.rope_dim,
             base=config.rope_theta,
             device=weights.device,
         )
@@ -236,7 +252,7 @@ class FlashLlamaAttention(torch.nn.Module):
             config,
             prefix=f"{prefix}.o_proj",
             weights=weights,
-            bias=False,
+            bias=config.attention_bias,
         )
         self.num_groups = self.num_heads // self.num_key_value_heads
         self.kv_head_mapping = torch.arange(
